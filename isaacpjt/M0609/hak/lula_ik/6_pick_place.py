@@ -1,10 +1,13 @@
 """
-궤적 보간 — 두 지점을 부드럽게 오가기
+Pick & Place — 상태 기계로 순서 만들기
 
-    isaac_python 4_interp.py
+    isaac_python 6_pick_place.py
 
-IK 는 점만 계산한다. 점과 점을 잇는 선은 우리가 그려야 한다.
-스텝당 이동 거리를 고정해 구간 길이와 무관하게 속도를 일정하게 유지한다.
+지금까지 배운 것을 하나로 엮는다.
+  TCP 오프셋으로 손가락 끝을 보내고 (2단계)
+  그리퍼를 열고 닫으며 (3단계)
+  구간을 보간해 이동하고 (4단계)
+  씬 구성은 Task 가 맡는다 (5단계)
 """
 
 from isaacsim import SimulationApp
@@ -19,6 +22,7 @@ import omni.usd
 from pxr import Usd, UsdGeom, UsdPhysics
 
 from isaacsim.core.api import World
+from isaacsim.core.api.tasks import BaseTask
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators.manipulators import SingleManipulator
 from isaacsim.robot_motion.motion_generation import (
@@ -93,9 +97,22 @@ TCP_OFFSET = np.array([0.0, 0.0, FINGER_PAD_TIP_Z])
 # ══════════════════════════════════════════════════════════════
 #  목표
 # ══════════════════════════════════════════════════════════════
-# 왕복할 두 지점. 큐브 위 10cm 높이에서 옆으로 이동한다
-POINT_A = np.array([0.25,  0.10, 0.15])
-POINT_B = np.array([0.55, -0.25, 0.15])
+# 큐브를 집을 곳과 놓을 곳 (xy)
+PICK_XY  = np.array([0.25,  0.10])
+PLACE_XY = np.array([0.45, -0.10])
+
+# 높이
+#   PICK_Z    큐브 상단면. 여기서 그리퍼를 닫으면 큐브 옆면을 문다
+#   PLACE_Z   놓을 때는 살짝 높게 두어 큐브가 튀지 않도록 한다
+#   APPROACH  집기 전 대기 높이
+#   LIFT      들고 이동할 높이
+PICK_Z          = 0.05
+PLACE_Z         = 0.055
+APPROACH_HEIGHT = 0.25
+LIFT_HEIGHT     = 0.23
+
+# 그리퍼를 닫고 기다리는 스텝 수
+GRIPPER_WAIT = 120
 
 # 보간 파라미터
 #   스텝 수를 고정하면 시간이 고정되어 먼 구간일수록 빨라진다.
@@ -196,81 +213,107 @@ def get_tcp_pose(robot):
 # ══════════════════════════════════════════════════════════════
 def steps_for(start, goal):
     """구간 길이를 속도로 나눠 스텝 수를 정한다"""
-    # dist = float(np.linalg.norm(goal - start))
-    # return int(np.clip(dist / TCP_SPEED, MIN_STEPS, MAX_STEPS)), dist
     dist = float(np.linalg.norm(goal - start))
-    return 70, dist
+    return int(np.clip(dist / TCP_SPEED, MIN_STEPS, MAX_STEPS)), dist
+
 
 def lerp(start, goal, alpha):
     """시작점에서 목표점까지 선형 보간"""
     return start + alpha * (goal - start)
 
 
-class Shuttle:
-    """두 지점을 왕복한다"""
+class PickPlaceFSM:
+    """
+    Pick & Place 순서를 담은 상태 기계.
 
-    def __init__(self, point_a, point_b):
-        self.points = [point_a, point_b]
+      0 APPROACH   큐브 위로 접근
+      1 DESCEND    큐브까지 하강
+      2 GRASP      그리퍼 닫기 (제자리)
+      3 LIFT       들어올리기
+      4 MOVE       놓을 곳 위로 이동
+      5 LOWER      놓을 높이까지 하강
+      6 RELEASE    그리퍼 열기 (제자리)
+      7 DONE
+
+    이동 단계는 보간으로 목표를 조금씩 옮기고,
+    그리퍼 단계는 제자리에서 스텝만 센다.
+    """
+
+    NAMES = ["APPROACH", "DESCEND", "GRASP", "LIFT",
+             "MOVE", "LOWER", "RELEASE", "DONE"]
+    GRIPPER_STATES = {2: "close", 6: "open"}     # 제자리에서 개폐만 하는 단계
+    DONE_STATE = 7
+
+    def __init__(self, robot):
+        self._robot = robot
+        self._build_waypoints()
         self.reset()
 
+    def _build_waypoints(self):
+        """각 단계가 도달할 TCP 목표를 미리 계산해 둔다"""
+        px, py = PICK_XY
+        gx, gy = PLACE_XY
+        self.waypoints = [
+            np.array([px, py, APPROACH_HEIGHT]),   # 0 APPROACH
+            np.array([px, py, PICK_Z]),            # 1 DESCEND
+            np.array([px, py, PICK_Z]),            # 2 GRASP
+            np.array([px, py, LIFT_HEIGHT]),       # 3 LIFT
+            np.array([gx, gy, LIFT_HEIGHT]),       # 4 MOVE
+            np.array([gx, gy, PLACE_Z]),           # 5 LOWER
+            np.array([gx, gy, PLACE_Z]),           # 6 RELEASE
+        ]
+
     def reset(self):
-        self.index = 1
+        self.state = 0
         self.step = 0
-        self.holding = 0
-        self.start = self.points[0]
-        self.goal = self.points[1]
-        self.n_steps, dist = steps_for(self.start, self.goal)
-        print(f"   move A -> B   {dist:.4f} m   {self.n_steps} steps")
+        self.start = None
+        self.goal = self.waypoints[0]
+        self.n_steps = MIN_STEPS
+        self.gripper = "open"
 
     def current_target(self):
-        """지금 이 스텝의 목표 지점"""
-        if self.holding > 0:
+        """이번 스텝의 TCP 목표"""
+        if self.start is None:
             return self.goal
         alpha = min(1.0, self.step / float(self.n_steps))
         return lerp(self.start, self.goal, alpha)
-        # return self.goal
-
-    
 
     def advance(self):
-        """한 스텝 진행한다. 도착하면 잠시 멈췄다가 방향을 바꾼다"""
-        if self.holding > 0:
-            self.holding -= 1
-            if self.holding == 0:
-                self._swap()
+        """한 스텝 진행한다"""
+        if self.state >= self.DONE_STATE:
             return
+
+        # 단계에 처음 들어온 순간 시작점과 스텝 수를 정한다
+        if self.start is None:
+            self.start = get_tcp_pose(self._robot)
+            self.goal = self.waypoints[self.state]
+            self.gripper = self.GRIPPER_STATES.get(self.state, self.gripper)
+
+            if self.state in self.GRIPPER_STATES:
+                self.n_steps = GRIPPER_WAIT
+                dist = 0.0
+            else:
+                self.n_steps, dist = steps_for(self.start, self.goal)
+
+            print(f"   [{self.state}] {self.NAMES[self.state]:9s}"
+                  f" goal {vec(self.goal)}"
+                  f"  {dist:.4f} m  {self.n_steps} steps  gripper {self.gripper}")
 
         self.step += 1
         if self.step >= self.n_steps:
-            self.holding = HOLD_STEPS
+            self._next()
 
-    def _swap(self):
-        self.index = 1 - self.index
-        self.start = self.goal
-        self.goal = self.points[self.index]
+    def _next(self):
+        self.state += 1
         self.step = 0
-        self.n_steps, dist = steps_for(self.start, self.goal)
-        name = "A -> B" if self.index == 1 else "B -> A"
-        print(f"   move {name}   {dist:.4f} m   {self.n_steps} steps")
+        self.start = None
+        if self.state >= self.DONE_STATE:
+            print(f"   [{self.DONE_STATE}] DONE")
 
 
 # ══════════════════════════════════════════════════════════════
-#  씬 구성
+#  씬 구성 — Task
 # ══════════════════════════════════════════════════════════════
-def load_usd():
-    """조립 완료된 M0609 USD 를 /World 아래에 참조로 올린다"""
-    stage = omni.usd.get_context().get_stage()
-    world_prim = stage.GetPrimAtPath("/World")
-    if not world_prim.IsValid():
-        world_prim = UsdGeom.Xform.Define(stage, "/World").GetPrim()
-
-    world_prim.GetReferences().AddReference(USD_PATH)
-    for _ in range(15):
-        simulation_app.update()
-
-    print("   USD          loaded")
-
-
 def find_prim_path(root_path, name):
     """USD 계층에서 이름으로 prim 경로를 찾는다"""
     stage = omni.usd.get_context().get_stage()
@@ -284,50 +327,83 @@ def find_prim_path(root_path, name):
     return None
 
 
-def setup_arm_drives():
-    """IK 결과를 로봇이 따라가도록 팔 관절의 Drive 를 강화한다"""
-    stage = omni.usd.get_context().get_stage()
-    count = 0
+class M0609Task(BaseTask):
+    """
+    set_up_scene 은 BaseTask 가 정한 이름이다. World 가 이 이름으로 부른다.
+    _ 로 시작하는 메서드는 우리가 나눈 것이라 이름을 바꿔도 된다.
+    """
 
-    for prim in Usd.PrimRange(stage.GetPrimAtPath(ROBOT_PRIM_PATH)):
-        if prim.GetName() not in ARM_JOINTS:
-            continue
-        for drive_type in ["angular", "linear"]:
-            drive = UsdPhysics.DriveAPI.Get(prim, drive_type)
-            if drive:
-                drive.GetStiffnessAttr().Set(DRIVE_STIFFNESS)
-                drive.GetDampingAttr().Set(DRIVE_DAMPING)
-                drive.GetMaxForceAttr().Set(DRIVE_MAX_FORCE)
-                count += 1
+    def __init__(self, name):
+        super().__init__(name=name, offset=None)
+        self._robot = None
 
-    print(f"   arm drives   {count}")
+    # ── 프레임워크 규약 ──────────────────────────────────
+    def set_up_scene(self, scene):
+        """world.reset() 안에서 자동으로 불린다"""
+        super().set_up_scene(scene)
+        self._load_usd()
+        self._setup_arm_drives()
+        self._register_robot(scene)
+        print("   scene        ready")
 
+    # ── 우리가 나눈 단계 ─────────────────────────────────
+    def _load_usd(self):
+        stage = omni.usd.get_context().get_stage()
+        world_prim = stage.GetPrimAtPath("/World")
+        if not world_prim.IsValid():
+            world_prim = UsdGeom.Xform.Define(stage, "/World").GetPrim()
 
-def register_robot(world):
-    """로봇과 그리퍼를 Articulation 으로 등록한다"""
-    ee_path = find_prim_path(ROBOT_PRIM_PATH, EE_LINK_NAME)
-    if ee_path is None:
-        raise RuntimeError(f"'{EE_LINK_NAME}' not found under {ROBOT_PRIM_PATH}")
+        world_prim.GetReferences().AddReference(USD_PATH)
+        for _ in range(15):
+            simulation_app.update()
 
-    # action_deltas 를 None 으로 두면 forward() 가 절대 위치를 명령한다
-    gripper = ParallelGripper(
-        end_effector_prim_path=ee_path,
-        joint_prim_names=GRIPPER_JOINTS,
-        joint_opened_positions=np.array([GRIPPER_OPEN_POS] * 2),
-        joint_closed_positions=np.array([GRIPPER_CLOSE_POS] * 2),
-        action_deltas=None,
-    )
+        print("   USD          loaded")
 
-    robot = world.scene.add(
-        SingleManipulator(
-            prim_path=ROBOT_PRIM_PATH,
-            name="m0609_robot",
+    def _setup_arm_drives(self):
+        """IK 결과를 로봇이 따라가도록 팔 관절의 Drive 를 강화한다"""
+        stage = omni.usd.get_context().get_stage()
+        count = 0
+
+        for prim in Usd.PrimRange(stage.GetPrimAtPath(ROBOT_PRIM_PATH)):
+            if prim.GetName() not in ARM_JOINTS:
+                continue
+            for drive_type in ["angular", "linear"]:
+                drive = UsdPhysics.DriveAPI.Get(prim, drive_type)
+                if drive:
+                    drive.GetStiffnessAttr().Set(DRIVE_STIFFNESS)
+                    drive.GetDampingAttr().Set(DRIVE_DAMPING)
+                    drive.GetMaxForceAttr().Set(DRIVE_MAX_FORCE)
+                    count += 1
+
+        print(f"   arm drives   {count}")
+
+    def _register_robot(self, scene):
+        """로봇과 그리퍼를 등록한다. world.scene 이 아니라 인자 scene 을 쓴다"""
+        ee_path = find_prim_path(ROBOT_PRIM_PATH, EE_LINK_NAME)
+        if ee_path is None:
+            raise RuntimeError(f"'{EE_LINK_NAME}' not found under {ROBOT_PRIM_PATH}")
+
+        gripper = ParallelGripper(
             end_effector_prim_path=ee_path,
-            gripper=gripper,
+            joint_prim_names=GRIPPER_JOINTS,
+            joint_opened_positions=np.array([GRIPPER_OPEN_POS] * 2),
+            joint_closed_positions=np.array([GRIPPER_CLOSE_POS] * 2),
+            action_deltas=None,
         )
-    )
-    print(f"   EE frame     {ee_path}")
-    return robot
+
+        self._robot = scene.add(
+            SingleManipulator(
+                prim_path=ROBOT_PRIM_PATH,
+                name="m0609_robot",
+                end_effector_prim_path=ee_path,
+                gripper=gripper,
+            )
+        )
+        print(f"   EE frame     {ee_path}")
+
+    @property
+    def robot(self):
+        return self._robot
 
 
 def init_gripper(robot, world):
@@ -393,18 +469,21 @@ def vec(v, digits=3):
 
 
 def print_target_info(target_quat):
-    """왕복 구간 정보를 확인한다"""
+    """Pick & Place 계획을 확인한다"""
     R = quat_to_matrix(target_quat)
-    n_steps, dist = steps_for(POINT_A, POINT_B)
 
-    section("TARGET")
-    print(f"   point A      {vec(POINT_A)}")
-    print(f"   point B      {vec(POINT_B)}")
-    print(f"   distance     {dist:.4f} m")
+    section("PLAN")
+    print(f"   pick xy      {vec(PICK_XY)}")
+    print(f"   place xy     {vec(PLACE_XY)}")
+    print()
+    print(f"   approach z   {APPROACH_HEIGHT}")
+    print(f"   pick z       {PICK_Z}")
+    print(f"   lift z       {LIFT_HEIGHT}")
+    print(f"   place z      {PLACE_Z}")
     print()
     print(f"   tcp speed    {TCP_SPEED} m/step")
-    print(f"   steps        {n_steps}   (min {MIN_STEPS}, max {MAX_STEPS})")
-    print(f"   tcp offset   {vec(TCP_OFFSET, 5)}")
+    print(f"   gripper      open {GRIPPER_OPEN_POS}  close {GRIPPER_CLOSE_POS}")
+    print(f"   gripper wait {GRIPPER_WAIT} steps")
     print()
     print(f"   tool   +Z    {vec(R @ np.array([0, 0, 1]))}   approach direction")
     print(f"   finger +X    {vec(R @ np.array([1, 0, 0]))}   finger direction")
@@ -429,15 +508,17 @@ def print_gripper_state(robot, command):
     print(f"   dof[6:12] {vec(q[6:12], 4)}")
 
 
-def print_status(robot, solved, target_tcp):
-    """지금 목표와 실제 손가락 끝을 함께 찍는다"""
+def print_status(robot, solved, fsm, target_tcp):
+    """현재 단계와 손가락 끝 위치를 함께 찍는다"""
+    name = fsm.NAMES[min(fsm.state, fsm.DONE_STATE)]
+
     if not solved:
-        print(f"   IK FAILED    target {vec(target_tcp)}")
+        print(f"   {name:9s} IK FAILED  target {vec(target_tcp)}")
         return
 
     tcp = get_tcp_pose(robot)
-    error = float(np.linalg.norm(tcp - target_tcp))
-    print(f"   goal {vec(target_tcp)}   tcp {vec(tcp)}   error {error:.5f}")
+    finger = robot.get_joint_positions()[robot.get_dof_index("finger_joint")]
+    print(f"   {name:9s} tcp {vec(tcp)}   finger {finger:+.4f}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -450,11 +531,12 @@ def main():
     world = World(stage_units_in_meters=1.0)
 
     section("SCENE")
-    load_usd()
-    robot = register_robot(world)
-    setup_arm_drives()
-
+    # world.reset() 이 Task.set_up_scene() 을 자동으로 부른다
+    task = M0609Task(name="m0609_task")
+    world.add_task(task)
     world.reset()
+
+    robot = task.robot
     robot.initialize()
     init_gripper(robot, world)
     set_ready_pose(robot)
@@ -474,7 +556,7 @@ def main():
     section("RUN")
     print("   press Play in the viewport\n")
 
-    shuttle = Shuttle(POINT_A, POINT_B)
+    fsm = PickPlaceFSM(robot)
     was_playing = False
     step = 0
 
@@ -490,12 +572,13 @@ def main():
             robot.initialize()
             init_gripper(robot, world)
             set_ready_pose(robot)
-            shuttle.reset()
+            fsm.reset()
             step = 0
+            print()
 
         if is_playing:
-            # 이번 스텝의 목표를 보간으로 구한다
-            target_tcp = shuttle.current_target()
+            # 팔 — 이번 스텝의 목표를 보간으로 구해 IK 로 푼다
+            target_tcp = fsm.current_target()
             flange_target = tcp_to_flange(target_tcp, target_quat)
 
             action, solved = ik_solver.compute_inverse_kinematics(
@@ -505,13 +588,13 @@ def main():
             if solved:
                 robot.apply_action(action)
 
-            # 이번 단원에서는 그리퍼를 열어 둔다
-            robot.apply_action(robot.gripper.forward(action="open"))
+            # 그리퍼 — 현재 단계가 정한 상태를 유지한다
+            robot.apply_action(robot.gripper.forward(action=fsm.gripper))
 
-            shuttle.advance()
+            fsm.advance()
 
             if step % LOG_INTERVAL == 0:
-                print_status(robot, solved, target_tcp)
+                print_status(robot, solved, fsm, target_tcp)
             step += 1
 
         was_playing = is_playing
