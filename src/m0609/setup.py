@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='rokey',
     maintainer_email='rockey9c3@gmail.com',
-    description='TODO: Package description',
+    description='M0609 색상 분류 시스템 — 손목 카메라 색상 감지 노드',
     license='Apache-2.0',
     extras_require={
         'test': [
@@ -24,6 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'm0609_color_detector = m0609.m0609_color_detector:main',
+            'color_tune = m0609.color_tune:main',
+            'fake_camera = m0609.fake_camera:main',
         ],
     },
 )
