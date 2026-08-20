@@ -4,7 +4,7 @@ PC A 최종본 — Isaac Sim Standalone Pick & Place + ROS 2
 - Wrist Camera -> /rgb (sensor_msgs/msg/Image)
 - /color_id (std_msgs/msg/Int32) 구독
 - 1 -> BLUE place / 2 -> GREEN place
-- Play 시작마다 Pick cube 색상 + WORLD X/Y 위치 랜덤 설정
+- Play 시작마다 Pick cube를 BLUE/GREEN 중 하나로 랜덤 설정
 - color_id가 늦으면 LIFT 위치에서 대기
 """
 
@@ -19,11 +19,12 @@ import random
 import time
 import numpy as np
 import omni.usd
+import omni.graph.core as og
+import omni.replicator.core as rep
 
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 from isaacsim.core.api import World
 from isaacsim.core.api.tasks import BaseTask
-from isaacsim.core.prims import SingleRigidPrim, SingleXFormPrim
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators.manipulators import SingleManipulator
@@ -79,18 +80,11 @@ TCP_OFFSET = np.array([0.0, 0.0, FINGER_PAD_TIP_Z])
 # ─────────────────────────────────────────────────────────────
 # Pick / Place
 # ─────────────────────────────────────────────────────────────
-PICK_XY = np.array([0.25, 0.10])  # 기본/초기 Pick 위치
-
-# Pick Cube 랜덤 Spawn 영역 (meter)
-# 필요하면 아래 4개 값만 수정하면 됨.
-SPAWN_X_MIN = 0.18
-SPAWN_X_MAX = 0.42
-SPAWN_Y_MIN = -0.22
-SPAWN_Y_MAX = 0.22
+PICK_XY = np.array([0.25, 0.10])
 
 # 실제 Stage의 마커 좌표가 다르면 이 두 줄만 수정
-BLUE_PLACE_XY = np.array([0.45, -0.30])
-GREEN_PLACE_XY = np.array([0.45, 0.30])
+BLUE_PLACE_XY = np.array([0.45, -0.10])
+GREEN_PLACE_XY = np.array([0.45, 0.10])
 
 PLACE_TARGETS = {
     1: BLUE_PLACE_XY,
@@ -129,19 +123,6 @@ CUBE_COLORS = {
     1: (0.02, 0.12, 1.00),   # BLUE
     2: (0.02, 0.80, 0.12),   # GREEN
 }
-
-
-# ─────────────────────────────────────────────────────────────
-# Place 바닥 마커
-# ─────────────────────────────────────────────────────────────
-MARKER_SIZE = 0.06       # 12 cm x 12 cm
-MARKER_THICKNESS = 0.003  # 3 mm
-MARKER_Z = MARKER_THICKNESS / 2.0
-
-BLUE_MARKER_PATH = "/World/PlaceMarkers/BluePlaceMarker"
-GREEN_MARKER_PATH = "/World/PlaceMarkers/GreenPlaceMarker"
-BLUE_MARKER_MATERIAL_PATH = "/World/Looks/BluePlaceMarkerMaterial"
-GREEN_MARKER_MATERIAL_PATH = "/World/Looks/GreenPlaceMarkerMaterial"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -228,21 +209,6 @@ class PickPlaceFSM:
             np.array([gx, gy, PLACE_Z]),
             np.array([gx, gy, PLACE_Z]),
         ]
-
-    def set_pick(self, pick_xy):
-        """랜덤 Spawn된 Cube 위치에 맞춰 Pick waypoint를 갱신."""
-        px, py = float(pick_xy[0]), float(pick_xy[1])
-
-        self.waypoints[0] = np.array([px, py, APPROACH_HEIGHT])
-        self.waypoints[1] = np.array([px, py, PICK_Z])
-        self.waypoints[2] = np.array([px, py, PICK_Z])
-        self.waypoints[3] = np.array([px, py, LIFT_HEIGHT])
-
-        # reset() 직후 첫 APPROACH 목표도 새 위치로 변경
-        if self.state == 0:
-            self.goal = self.waypoints[0]
-            self.start = None
-            self.step = 0
 
     def set_place(self, place_xy):
         gx, gy = place_xy
@@ -335,45 +301,9 @@ def find_wrist_camera_path():
     return str(cameras[0].GetPath()) if cameras else None
 
 
-def _find_rigid_body_ancestor(prim):
-    """
-    visual Cube/Mesh가 RigidBody Xform의 자식일 수 있으므로
-    실제로 움직여야 하는 physics body prim을 위쪽에서 찾는다.
-    """
-    current = prim
-
-    while current.IsValid():
-        try:
-            if current.HasAPI(UsdPhysics.RigidBodyAPI):
-                return current
-        except Exception:
-            pass
-
-        parent = current.GetParent()
-        if not parent.IsValid() or str(parent.GetPath()) in ("/", "/World"):
-            break
-
-        current = parent
-
-    return None
-
-
-def find_pick_cube_prims():
-    """
-    반환:
-        visual_prim : 실제 보이는 Pick cube geometry prim
-        body_prim   : 랜덤 Spawn 때 이동할 RigidBody root
-                      RigidBody가 없으면 visual_prim 자체
-
-    선택 원칙:
-      1) UsdGeom.Cube를 최우선
-      2) 이름/path에 'cube'가 있는 Mesh/Gprim
-      3) 마지막 fallback으로 이름에 'cube'가 있는 Xform 계열
-    """
+def find_pick_cube_prim():
     stage = omni.usd.get_context().get_stage()
-
-    geometry_candidates = []
-    fallback_candidates = []
+    candidates = []
 
     for prim in stage.Traverse():
         path = str(prim.GetPath())
@@ -381,14 +311,10 @@ def find_pick_cube_prims():
         if path.startswith(ROBOT_PRIM_PATH + "/"):
             continue
 
-        if path.startswith("/World/PlaceMarkers/"):
-            continue
-
-        if path.startswith("/World/Looks/"):
-            continue
-
         name = prim.GetName().lower()
-        path_lower = path.lower()
+
+        if not (prim.IsA(UsdGeom.Cube) or "cube" in name):
+            continue
 
         try:
             matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
@@ -400,37 +326,14 @@ def find_pick_cube_prims():
         except Exception:
             dist = 9999.0
 
-        # 실제 geometry를 우선
-        if prim.IsA(UsdGeom.Cube):
-            geometry_candidates.append((0, dist, prim))
-            continue
+        penalty = 0.0 if name == "cube" else 0.05
+        candidates.append((dist + penalty, prim))
 
-        if prim.IsA(UsdGeom.Mesh) and (
-            "cube" in name or "cube" in path_lower
-        ):
-            geometry_candidates.append((1, dist, prim))
-            continue
+    if not candidates:
+        return None
 
-        # fallback: 이름만 cube인 Xform 등
-        if "cube" in name:
-            fallback_candidates.append((dist, prim))
-
-    if geometry_candidates:
-        geometry_candidates.sort(key=lambda item: (item[0], item[1]))
-        visual_prim = geometry_candidates[0][2]
-    elif fallback_candidates:
-        fallback_candidates.sort(key=lambda item: item[0])
-        visual_prim = fallback_candidates[0][1]
-    else:
-        return None, None
-
-    rigid_prim = _find_rigid_body_ancestor(visual_prim)
-    body_prim = rigid_prim if rigid_prim is not None else visual_prim
-
-    print(f"   cube visual  {visual_prim.GetPath()}")
-    print(f"   cube body    {body_prim.GetPath()}")
-
-    return visual_prim, body_prim
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def set_cube_color(cube_prim, color_id):
@@ -476,273 +379,6 @@ def set_cube_color(cube_prim, color_id):
     name = "BLUE" if color_id == 1 else "GREEN"
     print(f"   cube         {cube_prim.GetPath()}")
     print(f"   random color {name}")
-
-
-def _get_usd_world_position(prim):
-    """USD hierarchy 기준 prim의 world translation을 읽는다."""
-    matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
-        Usd.TimeCode.Default()
-    )
-    p = matrix.ExtractTranslation()
-    return np.array(
-        [float(p[0]), float(p[1]), float(p[2])],
-        dtype=float,
-    )
-
-
-def set_cube_spawn_position(
-    world,
-    cube_visual_prim,
-    cube_body_prim,
-    spawn_xy,
-):
-    """
-    요청한 WORLD XY에 '보이는 Cube 중심'이 오도록 이동한다.
-
-    중요:
-    - RigidBody root와 보이는 Cube geometry의 pivot/중심은 다를 수 있다.
-    - 따라서 body root를 spawn_xy에 바로 두면 안 된다.
-    - 이동 전 visual-body WORLD offset을 계산하고,
-      그 offset을 보상한 body target을 사용한다.
-    - FSM에는 body root가 아니라 보이는 Cube의 실제/예측 WORLD XY를 반환한다.
-    """
-    if cube_visual_prim is None or not cube_visual_prim.IsValid():
-        raise RuntimeError("Pick cube visual prim을 찾지 못했습니다.")
-
-    if cube_body_prim is None or not cube_body_prim.IsValid():
-        raise RuntimeError("Pick cube body prim을 찾지 못했습니다.")
-
-    requested_visual_xy = np.array(
-        [float(spawn_xy[0]), float(spawn_xy[1])],
-        dtype=float,
-    )
-
-    body_path = str(cube_body_prim.GetPath())
-
-    is_rigid = False
-    try:
-        is_rigid = cube_body_prim.HasAPI(UsdPhysics.RigidBodyAPI)
-    except Exception:
-        is_rigid = False
-
-    if is_rigid:
-        cube_handle = SingleRigidPrim(
-            prim_path=body_path,
-            name="pick_cube_rigid_handle",
-            reset_xform_properties=False,
-        )
-        cube_handle.initialize(
-            physics_sim_view=world.physics_sim_view
-        )
-
-        body_before, body_orientation = cube_handle.get_world_pose()
-
-        # reset 직후의 authored hierarchy에서 보이는 cube 중심을 읽는다.
-        visual_before = _get_usd_world_position(cube_visual_prim)
-
-        # 보이는 geometry 중심과 physics body root 사이의 WORLD offset.
-        # orientation은 spawn 중 유지하므로 이 offset도 그대로 유지된다.
-        visual_minus_body = visual_before - np.asarray(
-            body_before,
-            dtype=float,
-        )
-
-        # visual center가 requested_visual_xy에 오도록 body root를 보정 이동
-        target_body_position = np.array(
-            [
-                requested_visual_xy[0] - visual_minus_body[0],
-                requested_visual_xy[1] - visual_minus_body[1],
-                float(body_before[2]),
-            ],
-            dtype=float,
-        )
-
-        cube_handle.set_world_pose(
-            position=target_body_position,
-            orientation=body_orientation,
-        )
-
-        # 이전 trial 속도 제거
-        cube_handle.set_linear_velocity(
-            np.zeros(3, dtype=float)
-        )
-        cube_handle.set_angular_velocity(
-            np.zeros(3, dtype=float)
-        )
-
-        body_after, _ = cube_handle.get_world_pose()
-        body_after = np.asarray(body_after, dtype=float)
-
-        # orientation을 바꾸지 않았으므로 같은 world offset을 적용 가능
-        visual_after = body_after + visual_minus_body
-
-    else:
-        # RigidBody가 없는 단순 Xform/Cube
-        cube_handle = SingleXFormPrim(
-            prim_path=body_path,
-            name="pick_cube_xform_handle",
-            reset_xform_properties=False,
-        )
-
-        current_position, current_orientation = cube_handle.get_world_pose()
-
-        target_position = np.array(
-            [
-                requested_visual_xy[0],
-                requested_visual_xy[1],
-                float(current_position[2]),
-            ],
-            dtype=float,
-        )
-
-        cube_handle.set_world_pose(
-            position=target_position,
-            orientation=current_orientation,
-        )
-
-        actual_position, _ = cube_handle.get_world_pose()
-        visual_after = np.asarray(actual_position, dtype=float)
-
-    actual_visual_xy = np.array(
-        [
-            float(visual_after[0]),
-            float(visual_after[1]),
-        ],
-        dtype=float,
-    )
-
-    error_xy = float(
-        np.linalg.norm(
-            actual_visual_xy - requested_visual_xy
-        )
-    )
-
-    print(
-        f"   spawn request VISUAL "
-        f"({requested_visual_xy[0]:.4f}, {requested_visual_xy[1]:.4f})"
-    )
-
-    if is_rigid:
-        print(
-            f"   visual-body offset "
-            f"({visual_minus_body[0]:+.4f}, "
-            f"{visual_minus_body[1]:+.4f})"
-        )
-
-    print(
-        f"   spawn actual VISUAL "
-        f"({actual_visual_xy[0]:.4f}, {actual_visual_xy[1]:.4f})"
-    )
-    print(
-        f"   spawn XY error "
-        f"{error_xy * 1000.0:.2f} mm"
-    )
-
-    if error_xy > 0.002:
-        print(
-            "   WARNING      visual spawn error > 2 mm"
-        )
-
-    # FSM/그리퍼가 실제 보이는 cube 중심 XY를 사용
-    return actual_visual_xy
-
-
-def _ensure_scope(stage, path):
-    prim = stage.GetPrimAtPath(path)
-    if not prim.IsValid():
-        UsdGeom.Scope.Define(stage, path)
-
-
-def create_marker_material(stage, material_path, color):
-    material = UsdShade.Material.Define(stage, material_path)
-    shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
-
-    shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput(
-        "diffuseColor",
-        Sdf.ValueTypeNames.Color3f,
-    ).Set(Gf.Vec3f(*color))
-    shader.CreateInput(
-        "roughness",
-        Sdf.ValueTypeNames.Float,
-    ).Set(0.4)
-    shader.CreateInput(
-        "metallic",
-        Sdf.ValueTypeNames.Float,
-    ).Set(0.0)
-
-    material.CreateSurfaceOutput().ConnectToSource(
-        shader.ConnectableAPI(),
-        "surface",
-    )
-    return material
-
-
-def create_floor_marker(stage, prim_path, xy, color, material_path):
-    # 이전 실행에서 같은 마커가 남아 있으면 새로 만들기 위해 제거
-    old_prim = stage.GetPrimAtPath(prim_path)
-    if old_prim.IsValid():
-        stage.RemovePrim(prim_path)
-
-    marker = UsdGeom.Cube.Define(stage, prim_path)
-    marker.CreateSizeAttr(1.0)
-
-    xform = UsdGeom.Xformable(marker.GetPrim())
-    xform.AddTranslateOp().Set(
-        Gf.Vec3d(
-            float(xy[0]),
-            float(xy[1]),
-            float(MARKER_Z),
-        )
-    )
-    xform.AddScaleOp().Set(
-        Gf.Vec3f(
-            float(MARKER_SIZE),
-            float(MARKER_SIZE),
-            float(MARKER_THICKNESS),
-        )
-    )
-
-    material = create_marker_material(
-        stage,
-        material_path,
-        color,
-    )
-
-    UsdShade.MaterialBindingAPI.Apply(
-        marker.GetPrim()
-    ).Bind(material)
-
-    return marker.GetPrim()
-
-
-def create_place_markers():
-    stage = omni.usd.get_context().get_stage()
-
-    # 물리 충돌이 없는 시각용 마커만 생성
-    if not stage.GetPrimAtPath("/World/PlaceMarkers").IsValid():
-        UsdGeom.Xform.Define(stage, "/World/PlaceMarkers")
-
-    _ensure_scope(stage, "/World/Looks")
-
-    create_floor_marker(
-        stage=stage,
-        prim_path=BLUE_MARKER_PATH,
-        xy=BLUE_PLACE_XY,
-        color=CUBE_COLORS[1],
-        material_path=BLUE_MARKER_MATERIAL_PATH,
-    )
-
-    create_floor_marker(
-        stage=stage,
-        prim_path=GREEN_MARKER_PATH,
-        xy=GREEN_PLACE_XY,
-        color=CUBE_COLORS[2],
-        material_path=GREEN_MARKER_MATERIAL_PATH,
-    )
-
-    print(f"   blue marker  {vec(BLUE_PLACE_XY)}")
-    print(f"   green marker {vec(GREEN_PLACE_XY)}")
 
 
 class M0609Task(BaseTask):
@@ -857,6 +493,49 @@ class ColorReceiver:
         print(f"   ROS2 RX      color_id={value} ({name})")
 
 
+def setup_rgb_publisher(camera_prim_path):
+    render_product = rep.create.render_product(
+        camera_prim_path,
+        CAMERA_RESOLUTION,
+    )
+
+    K = og.Controller.Keys
+
+    og.Controller.edit(
+        {
+            "graph_path": "/ROS2CameraGraph",
+            "evaluator_name": "execution",
+        },
+        {
+            K.CREATE_NODES: [
+                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+                ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
+                ("CameraHelper", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+            ],
+            K.CONNECT: [
+                ("OnPlaybackTick.outputs:tick", "CameraHelper.inputs:execIn"),
+                ("ROS2Context.outputs:context", "CameraHelper.inputs:context"),
+            ],
+            K.SET_VALUES: [
+                ("ROS2Context.inputs:domain_id", ROS_DOMAIN_ID),
+                ("CameraHelper.inputs:renderProductPath", render_product.path),
+                ("CameraHelper.inputs:topicName", RGB_TOPIC),
+                ("CameraHelper.inputs:frameId", CAMERA_FRAME_ID),
+                ("CameraHelper.inputs:type", "rgb"),
+            ],
+        },
+    )
+
+    for _ in range(10):
+        simulation_app.update()
+
+    print(f"   camera       {camera_prim_path}")
+    print(f"   publish      {RGB_TOPIC}  sensor_msgs/msg/Image")
+    print(f"   resolution   {CAMERA_RESOLUTION[0]} x {CAMERA_RESOLUTION[1]}")
+
+    return render_product
+
+
 # ─────────────────────────────────────────────────────────────
 # Robot init / IK
 # ─────────────────────────────────────────────────────────────
@@ -943,9 +622,6 @@ def main():
     world.add_task(task)
     world.reset()
 
-    # 파랑/초록 Place 바닥 마커 생성
-    create_place_markers()
-
     robot = task.robot
     robot.initialize()
     init_gripper(robot, world)
@@ -958,14 +634,14 @@ def main():
     if camera_path is None:
         raise RuntimeError("Wrist Camera를 찾지 못했습니다.")
 
-    cube_visual_prim, cube_body_prim = find_pick_cube_prims()
-
-    if cube_visual_prim is None or cube_body_prim is None:
+    cube_prim = find_pick_cube_prim()
+    if cube_prim is None:
         raise RuntimeError("Pick cube를 찾지 못했습니다.")
 
     section("ROS2")
 
     color_receiver = ColorReceiver()
+    render_product = setup_rgb_publisher(camera_path)
 
     section("SOLVER")
 
@@ -978,15 +654,10 @@ def main():
     )
 
     section("PLAN")
-    print(f"   default pick {vec(PICK_XY)}")
-    print(
-        f"   spawn range  WORLD X[{SPAWN_X_MIN:.2f}, {SPAWN_X_MAX:.2f}] "
-        f"Y[{SPAWN_Y_MIN:.2f}, {SPAWN_Y_MAX:.2f}]"
-    )
+    print(f"   pick xy      {vec(PICK_XY)}")
     print(f"   blue  (1)    {vec(BLUE_PLACE_XY)}")
     print(f"   green (2)    {vec(GREEN_PLACE_XY)}")
-    print(f"   marker size  {MARKER_SIZE:.3f} m square")
-    print(f"   rgb topic    {RGB_TOPIC}  (existing USD Camera Helper)")
+    print(f"   rgb topic    {RGB_TOPIC}")
     print(f"   color topic  {COLOR_TOPIC}")
     print(f"   domain id    {ROS_DOMAIN_ID}")
 
@@ -1025,37 +696,9 @@ def main():
             fsm.reset()
             step = 0
 
-            # ─────────────────────────────────────────────
-            # Pick Cube 위치 랜덤 Spawn
-            # ─────────────────────────────────────────────
-            random_pick_xy = np.array([
-                random.uniform(SPAWN_X_MIN, SPAWN_X_MAX),
-                random.uniform(SPAWN_Y_MIN, SPAWN_Y_MAX),
-            ])
-
-            # 실제 Cube BODY를 WORLD 좌표로 이동
-            # 그리고 보이는 Cube 중심의 실제 WORLD XY를 반환받음
-            actual_pick_xy = set_cube_spawn_position(
-                world,
-                cube_visual_prim,
-                cube_body_prim,
-                random_pick_xy,
-            )
-
-            # gripper/FSM은 요청 랜덤값이 아니라
-            # 실제 Cube WORLD 위치를 그대로 사용
-            fsm.set_pick(
-                actual_pick_xy,
-            )
-
-            # ─────────────────────────────────────────────
-            # Pick Cube 색상 랜덤
-            # ─────────────────────────────────────────────
+            # Pick cube를 파랑/초록 중 랜덤으로 설정
             random_color_id = random.choice([1, 2])
-            set_cube_color(
-                cube_visual_prim,
-                random_color_id,
-            )
+            set_cube_color(cube_prim, random_color_id)
 
             # 이전 실행에서 받은 color_id는 사용하지 않음
             accepted_color_id = None
@@ -1149,6 +792,7 @@ def main():
     if rclpy.ok():
         rclpy.shutdown()
 
+    _ = render_product
     simulation_app.close()
 
 
