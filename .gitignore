@@ -220,3 +220,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Isaac Sim USD 자동 백업
+*.usd.bak*
