@@ -77,6 +77,11 @@ SUCTION_MOUNT_Z = 0.08
 SUCTION_CUP_RADIUS = 0.035
 SUCTION_CUP_THICKNESS = 0.012
 
+# 플랜지와 흡착판 사이를 채우는 그리퍼 몸통 (퀵체인저 + 진공 발생기).
+# 이게 없으면 흡착판만 플랜지에서 SUCTION_MOUNT_Z 만큼 공중에 떠 보인다.
+# 시각용이라 충돌은 끈다 — TCP_OFFSET 과 모션 값에는 영향이 없다.
+SUCTION_BODY_RADIUS = 0.045
+
 # 흡착판 아랫면까지의 거리 = TCP 오프셋
 TCP_OFFSET = np.array([0.0, 0.0, SUCTION_MOUNT_Z + SUCTION_CUP_THICKNESS / 2.0])
 
@@ -204,9 +209,13 @@ else:  # h2017  — 확정 사양 (2026-08-20 사양서)
     # 매 사이클 팔이 150도 넘게 돌아야 하고 그 경로의 방위각 0도 부근에서
     # 흡착이 끊긴다. 옆으로 옮기면 픽 방위각이 155도가 되어 회전각이
     # 128도 이하로 줄고 문제 구간을 아예 지나지 않는다.
-    CONVEYOR_TOP_H = 0.85
+    # 트럭 적재함 바닥 지상고 (1톤 윙바디). 측면 윙바디에 컨베이어를 대고
+    # 직접 싣는 방식이라 컨베이어 토출 높이 = 트럭 바닥 높이여야 한다.
+    # test1.usd 는 이 값으로 라인 전 구간을 평탄화해 뒀다 (flatten_line.py).
+    TRUCK_FLOOR_H = 0.900
+    CONVEYOR_TOP_H = TRUCK_FLOOR_H
     # 파렛트(x >= 0)와 300mm 이상 띄운다. 붙여 놓으면 파렛트 근처 자리로
-    # 내려오는 박스가 컨베이어 상면(850mm) 모서리를 스쳐 흡착이 끊긴다.
+    # 내려오는 박스가 컨베이어 상면(900mm) 모서리를 스쳐 흡착이 끊긴다.
     CONVEYOR_CENTER = np.array([-0.600, 0.125, CONVEYOR_TOP_H - 0.04])
     CONVEYOR_SIZE = np.array([0.600, 1.200, 0.04])
     PICK_XY = np.array([-0.600, 0.125])
@@ -333,9 +342,16 @@ RANDOM_SEED = 42
 # 이 30mm 가 필요하다.
 TRUCK_BED = np.array([2.80, 1.60])      # 사양: 2800 x 1600 x 1600
 TRUCK_INNER_H = 1.60
+TRUCK_FLOOR_H = globals().get("TRUCK_FLOOR_H", 0.900)
+
+# 적재 장수는 공칭 1200x800 이 아니라 실치수로 따진다. Isaac pallet.usd 는
+# EUR1 1213 x 802 라 802 x 2 = 1604 > 1600 이 되어 폭 방향 2열이 안 들어간다.
+# 공칭값으로 계산하면 2x2 = 4 장이 나오지만 실제로는 안 실린다.
+# 800 을 길이 방향으로 세워 3장 (2400 <= 2800, 1200 <= 1600, 여유 400씩).
+PALLET_FOOTPRINT = np.array([1.213, 0.802])
 PALLET_LAYOUT = (
-    max(int(TRUCK_BED[0] // PALLET_SIZE[0]) * int(TRUCK_BED[1] // PALLET_SIZE[1]),
-        int(TRUCK_BED[0] // PALLET_SIZE[1]) * int(TRUCK_BED[1] // PALLET_SIZE[0])),
+    max(int(TRUCK_BED[0] // PALLET_FOOTPRINT[0]) * int(TRUCK_BED[1] // PALLET_FOOTPRINT[1]),
+        int(TRUCK_BED[0] // PALLET_FOOTPRINT[1]) * int(TRUCK_BED[1] // PALLET_FOOTPRINT[0])),
     1,
 )
 

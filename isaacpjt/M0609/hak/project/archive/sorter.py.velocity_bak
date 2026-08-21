@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""색상별로 박스를 분기 스퍼로 빼낸다.
+
+배정 — 먼 곳부터 R, G, B
+    3호 빨강 (R)  ->  라인 끝 (상단 _08_B). 분기 없이 그대로 통과.
+    4호 초록 (G)  ->  중간 분기 y 9.204  (_06/Belt_01 -> _10)
+    5호 파랑 (B)  ->  첫 분기   y 5.413  (_05/Belt_01 -> _12 -> _04)
+
+왜 스크립트가 필요한가
+  분기 레인 Belt_01 은 x -9.06 부터 시작하는데 본선 레인은 x -9.95..-9.05 다.
+  본선 한가운데(x -9.5)에 놓인 박스는 가장 큰 5호(480mm)라도 오른쪽 끝이
+  -9.256 이라 Belt_01 에 닿지 않는다. 벨트만으로는 절대 안 넘어간다.
+  그래서 해당 색 박스가 분기 y 에 도달하면 +X 로 밀어 Belt_01 에 올려준다.
+  일단 올라가면 Belt_01 -> 스퍼가 알아서 끌고 간다.
+
+    import sorter; sorter.start()
+  또는 open_test1.py 가 피더와 같이 붙여준다.
+"""
+
+import os
+
+import omni.timeline
+import omni.usd
+from omni.physx import get_physx_interface
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+BOX_ROOT = "/World/Boxes"
+
+# 색 -> (분기 중심 y, 목적지 이름). y 가 None 이면 분기하지 않고 끝까지 간다.
+ROUTE = {
+    "No3": (None,  "라인 끝 (빨강)"),
+    "No4": (9.204, "중간 분기 (초록)"),
+    "No5": (5.413, "첫 분기 (파랑)"),
+}
+
+PUSH_VX = float(os.environ.get("PL_PUSH_VX", 1.5))   # 옆으로 미는 속도 [m/s]
+
+# 분기 레인 Belt_01 의 y 폭은 900mm (예: 첫 분기 4.963..5.863).
+# 가장 큰 5호가 480mm 라 레인 중심에서 210mm 만 벗어나도 한쪽이 레인 밖으로
+# 걸친다. 그 상태로 밀면 벨트가 아니라 프레임에 얹혀 그대로 멈춘다.
+# 그래서 중심 근처에서만 민다.
+Y_TOL = float(os.environ.get("PL_Y_TOL", 0.12))
+
+# 스퍼(_12/_10)는 x -7.3 부터다. 여기까지 밀어야 벨트가 이어받는다.
+# -8.55 에서 손을 떼면 Belt_01 위에서 멈추거나 본선으로 되돌아간다.
+X_DONE = float(os.environ.get("PL_X_DONE", -7.0))
+X_MAIN_MAX = -9.0         # 본선 레인에 있다고 볼 수 있는 x 상한
+
+_state = {}
+
+
+def start():
+    stage = omni.usd.get_context().get_stage()
+    _state.update(stage=stage, pushing={}, done=set(), routed={})
+    _state["physics_sub"] = get_physx_interface().subscribe_physics_step_events(_on_step)
+    _state["timeline_sub"] = (
+        omni.timeline.get_timeline_interface()
+        .get_timeline_event_stream()
+        .create_subscription_to_pop(_on_timeline)
+    )
+    print("[sorter] 색상 분류 시작 — 먼 곳부터 R/G/B")
+    for slug, (y, label) in ROUTE.items():
+        where = "분기 없음" if y is None else f"y={y:.3f}"
+        print(f"[sorter]   {slug}  {label:<16} {where}")
+
+
+def stop():
+    _state["physics_sub"] = None
+    _state["timeline_sub"] = None
+    _state.clear()
+
+
+def _on_timeline(event):
+    if event.type == int(omni.timeline.TimelineEventType.STOP):
+        _state["pushing"] = {}
+        _state["done"] = set()
+        _state["routed"] = {}
+
+
+def _slug(name):
+    for s in ROUTE:
+        if name.endswith(s):
+            return s
+    return None
+
+
+def _pos(prim):
+    m = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    return m.ExtractTranslation()
+
+
+def _set_vx(prim, vx, vy, vz):
+    """리지드바디 선속도를 덮어쓴다. physics:velocity 를 쓰면 PhysX 가 받아간다.
+
+    z 는 건드리지 않는다. 매 스텝 0 으로 박으면 박스가 안 가라앉아
+    벨트에 제대로 안 얹힌 채로 떠간다."""
+    rb = UsdPhysics.RigidBodyAPI(prim)
+    attr = rb.GetVelocityAttr()
+    if not attr:
+        attr = rb.CreateVelocityAttr()
+    attr.Set(Gf.Vec3f(float(vx), float(vy), float(vz)))
+
+
+def _on_step(dt):
+    stage = _state.get("stage")
+    if stage is None:
+        return
+    root = stage.GetPrimAtPath(BOX_ROOT)
+    if not root:
+        return
+
+    pushing, done = _state["pushing"], _state["done"]
+
+    for prim in root.GetChildren():
+        path = prim.GetPath().pathString
+        if path in done:
+            continue
+        slug = _slug(prim.GetName())
+        if slug is None:
+            continue
+        target_y, label = ROUTE[slug]
+        if target_y is None:
+            done.add(path)                      # 빨강은 손대지 않는다
+            continue
+
+        p = _pos(prim)
+
+        if path in pushing:
+            prev_z = pushing[path]
+            vz = (p[2] - prev_z) / dt if dt > 0 else 0.0
+            pushing[path] = p[2]
+            if p[0] > X_DONE:                   # 스퍼까지 올라탔다
+                pushing.pop(path)
+                done.add(path)
+                _state["routed"][path] = label
+                print(f"[sorter] {prim.GetName()} -> {label}  (x={p[0]:.3f}, y={p[1]:.3f})")
+            else:
+                # y 를 분기 레인 중심으로 되돌리며 옆으로 민다.
+                vy = (target_y - p[1]) * 2.0
+                _set_vx(prim, PUSH_VX, vy, vz)
+            continue
+
+        # 본선 레인에서 분기 y 에 도달했는가
+        if p[0] < X_MAIN_MAX and abs(p[1] - target_y) < Y_TOL:
+            pushing[path] = p[2]
+            _set_vx(prim, PUSH_VX, 0.0, 0.0)

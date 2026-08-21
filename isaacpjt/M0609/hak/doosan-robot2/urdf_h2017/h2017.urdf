@@ -1,0 +1,69 @@
+<?xml version="1.0"?>
+<!-- H2017 — h2017.usd 의 조인트 로컬 프레임에서 직접 생성.
+     Isaac 의 URDF 익스포터는 관성 누락으로 빈 파일을 뱉어서 손으로 작성했다.
+     Lula IK 는 기구학만 쓰므로 관성은 근사값이다. -->
+<robot name="h2017">
+  <link name="base_link">
+    <inertial><mass value="8.537"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <link name="link_1">
+    <inertial><mass value="20.253"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <joint name="joint_1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link_1"/>
+    <origin xyz="0.000000 0.000000 0.344300" rpy="0.000000000 -0.000000000 0.000000000"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="1000" velocity="1.7453"/>
+  </joint>
+  <link name="link_2">
+    <inertial><mass value="28.536"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <joint name="joint_2" type="revolute">
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <origin xyz="0.000000 0.009900 0.000000" rpy="3.141490654 -1.570592327 1.570694327"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.181662" upper="2.181662" effort="1000" velocity="1.3963"/>
+  </joint>
+  <link name="link_3">
+    <inertial><mass value="6.421"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <joint name="joint_3" type="revolute">
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <origin xyz="0.845000 0.000000 0.000000" rpy="0.000000000 -0.000000000 1.570999973"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.792527" upper="2.792527" effort="600" velocity="1.7453"/>
+  </joint>
+  <link name="link_4">
+    <inertial><mass value="7.59"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <joint name="joint_4" type="revolute">
+    <parent link="link_3"/>
+    <child link="link_4"/>
+    <origin xyz="0.000000 -0.734000 0.000000" rpy="1.570999973 -0.000000000 0.000000000"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="200" velocity="3.1416"/>
+  </joint>
+  <link name="link_5">
+    <inertial><mass value="4.099"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <joint name="joint_5" type="revolute">
+    <parent link="link_4"/>
+    <child link="link_5"/>
+    <origin xyz="0.000000 0.000000 0.000000" rpy="-1.570999973 0.000000000 0.000000000"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="200" velocity="3.1416"/>
+  </joint>
+  <link name="link_6">
+    <inertial><mass value="0.897"/><origin xyz="0 0 0"/><inertia ixx="0.1" ixy="0" ixz="0" iyy="0.1" iyz="0" izz="0.1"/></inertial>
+  </link>
+  <joint name="joint_6" type="revolute">
+    <parent link="link_5"/>
+    <child link="link_6"/>
+    <origin xyz="0.000000 -0.121000 0.000000" rpy="1.570999973 -0.000000000 0.000000000"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-6.283185" upper="6.283185" effort="200" velocity="3.1416"/>
+  </joint>
+</robot>

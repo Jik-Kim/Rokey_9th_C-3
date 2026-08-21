@@ -55,6 +55,28 @@ def build_suction(stage, link6_path: str) -> str:
     gripper_path = f"{link6_path}/SurfaceGripper"
     joints_scope = f"{link6_path}/AttachmentPoints"
 
+    # ── 그리퍼 몸통 (플랜지 면 ~ 흡착판) ────────────────────
+    # 플랜지 끝면이 link_6 로컬 z=0 이고 흡착판은 z=SUCTION_MOUNT_Z 에서
+    # 시작한다. 그 사이가 비어 있으면 흡착판만 공중에 떠 있는 것처럼 보인다.
+    # 실물로 치면 퀵체인저와 진공 발생기가 들어가는 자리다.
+    if C.SUCTION_MOUNT_Z > 0:
+        body_path = f"{link6_path}/suction_body"
+        body = UsdGeom.Cylinder.Define(stage, body_path)
+        body.CreateAxisAttr("Z")
+        body.CreateRadiusAttr(float(C.SUCTION_BODY_RADIUS))
+        body.CreateHeightAttr(float(C.SUCTION_MOUNT_Z))
+        body.CreateExtentAttr([
+            Gf.Vec3f(-C.SUCTION_BODY_RADIUS, -C.SUCTION_BODY_RADIUS,
+                     -C.SUCTION_MOUNT_Z / 2.0),
+            Gf.Vec3f(C.SUCTION_BODY_RADIUS, C.SUCTION_BODY_RADIUS,
+                     C.SUCTION_MOUNT_Z / 2.0),
+        ])
+        body.CreateDisplayColorAttr([Gf.Vec3f(0.35, 0.36, 0.40)])
+        UsdGeom.Xformable(body).AddTranslateOp().Set(
+            Gf.Vec3d(0.0, 0.0, C.SUCTION_MOUNT_Z / 2.0))
+        # 흡착판과 같은 이유로 충돌은 끈다 (접근 중 박스를 밀어낸다).
+        UsdPhysics.CollisionAPI.Apply(body.GetPrim()).CreateCollisionEnabledAttr(False)
+
     # ── 흡착판 지오메트리 (link_6 자식) ─────────────────────
     cup_path = f"{link6_path}/suction_cup"
     cup = UsdGeom.Cylinder.Define(stage, cup_path)

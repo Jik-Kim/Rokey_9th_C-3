@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""색상별로 박스를 분기 스퍼로 빼낸다. 실물 푸셔로 민다.
+
+배정 — 먼 곳부터 R, G, B
+    3호 빨강 (R)  ->  라인 끝 (상단 _08_B). 분기 없이 통과.
+    4호 초록 (G)  ->  중간 분기 y 9.204  (_06/Belt_01 -> _10)
+    5호 파랑 (B)  ->  첫 분기   y 5.413  (_05/Belt_01 -> _12 -> _04)
+
+왜 푸셔인가
+  본선 레인은 x -9.946..-9.046, 분기 레인 Belt_01 은 x -9.057 부터다.
+  본선 한가운데(x -9.5)의 박스는 가장 큰 5호(480mm)라도 오른쪽 끝이
+  -9.256 이라 분기 레인에 안 닿는다. 벨트만으로는 분기가 안 일어난다.
+
+  이전 판은 박스의 physics:velocity 를 직접 덮어썼는데, 바닥이 벨트 마찰로
+  붙잡힌 상태에서 몸통만 튕겨나가 박스가 뒤집혔다. 키네매틱 밀대가 옆면을
+  밀면 접촉점에서 힘이 들어가 그 현상이 없다.
+
+색 판정
+  지금은 프림 이름의 No3/No4/No5 접미사를 읽는다. 이건 정답지를 보는 것이라
+  인식이 아니다. 카메라 RGB 판정이 붙으면 _color_of() 만 갈아끼우면 된다.
+
+    import sorter; sorter.start()
+"""
+
+import os
+
+import omni.timeline
+import omni.usd
+from omni.physx import get_physx_interface
+from pxr import Gf, Usd, UsdGeom
+
+BOX_ROOT = "/World/Boxes"
+PUSHER_ROOT = "/World/Pushers"
+
+# 색 -> (분기 중심 y, 푸셔 이름, 라벨). y 가 None 이면 끝까지 간다.
+ROUTE = {
+    "No3": (None,  None,    "라인 끝 (빨강)"),
+    "No4": (9.204, "Green", "중간 분기 (초록)"),
+    "No5": (5.413, "Blue",  "첫 분기 (파랑)"),
+}
+
+HOME_X = -10.20
+EXTEND_X = -9.30
+PUSH_SPEED = float(os.environ.get("PL_PUSH_SPEED", 0.9))     # 전진 [m/s]
+RETRACT_SPEED = float(os.environ.get("PL_RETRACT_SPEED", 1.2))
+HOLD_S = 0.15
+
+# 트리거 창. 박스가 분기 중심 아래쪽에서 올라올 때 민다.
+# 미는 동안 본선 벨트가 박스를 +Y 로 계속 옮기므로, 중심보다 앞서 시작해야
+# 다 밀렸을 때 분기 레인(폭 900mm) 한가운데에 놓인다.
+TRIG_LO = 0.40
+TRIG_HI = 0.05
+
+X_ON_LANE = -9.05      # 박스 중심이 이걸 넘으면 Belt_01 이 이어받는다
+
+_state = {}
+
+
+def start():
+    stage = omni.usd.get_context().get_stage()
+    pushers = {}
+    for _, (_, pname, _lbl) in ROUTE.items():
+        if pname is None:
+            continue
+        prim = stage.GetPrimAtPath(f"{PUSHER_ROOT}/Pusher_{pname}")
+        if not prim:
+            print(f"[sorter] 푸셔 없음: {PUSHER_ROOT}/Pusher_{pname} "
+                  f"— run_add_pushers.sh 를 먼저 돌려라")
+            continue
+        pushers[pname] = {"prim": prim, "phase": "idle", "x": HOME_X,
+                          "hold": 0.0, "box": None}
+    _state.update(stage=stage, pushers=pushers, claimed=set(),
+                  routed={}, seen=set())
+    _state["physics_sub"] = get_physx_interface().subscribe_physics_step_events(_on_step)
+    _state["timeline_sub"] = (
+        omni.timeline.get_timeline_interface()
+        .get_timeline_event_stream()
+        .create_subscription_to_pop(_on_timeline)
+    )
+    print("[sorter] 색상 분류 시작 — 먼 곳부터 R/G/B (푸셔 구동)")
+    for slug, (y, pname, label) in ROUTE.items():
+        where = "분기 없음" if y is None else f"y={y:.3f}  Pusher_{pname}"
+        print(f"[sorter]   {slug}  {label:<16} {where}")
+
+
+def stop():
+    _state["physics_sub"] = None
+    _state["timeline_sub"] = None
+    _state.clear()
+
+
+def _on_timeline(event):
+    if event.type == int(omni.timeline.TimelineEventType.STOP):
+        for st in _state.get("pushers", {}).values():
+            st.update(phase="idle", x=HOME_X, hold=0.0, box=None)
+            _move(st["prim"], HOME_X)
+        _state["claimed"] = set()
+        _state["routed"] = {}
+
+
+def _color_of(prim):
+    """박스 색을 돌려준다. 카메라 인식이 붙으면 여기만 교체한다."""
+    name = prim.GetName()
+    for slug in ROUTE:
+        if name.endswith(slug):
+            return slug
+    return None
+
+
+def _pos(prim):
+    m = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+    return m.ExtractTranslation()
+
+
+def _move(prim, x):
+    attr = prim.GetAttribute("xformOp:translate")
+    t = attr.Get()
+    attr.Set(Gf.Vec3d(float(x), float(t[1]), float(t[2])))
+
+
+def _on_step(dt):
+    stage = _state.get("stage")
+    if stage is None:
+        return
+    root = stage.GetPrimAtPath(BOX_ROOT)
+    if not root:
+        return
+    pushers = _state["pushers"]
+    claimed = _state["claimed"]
+
+    # ── 푸셔 상태 진행 ──────────────────────────────────
+    for pname, st in pushers.items():
+        if st["phase"] == "extend":
+            st["x"] = min(EXTEND_X, st["x"] + PUSH_SPEED * dt)
+            _move(st["prim"], st["x"])
+            if st["x"] >= EXTEND_X - 1e-6:
+                st["phase"] = "hold"
+                st["hold"] = HOLD_S
+        elif st["phase"] == "hold":
+            st["hold"] -= dt
+            if st["hold"] <= 0.0:
+                st["phase"] = "retract"
+        elif st["phase"] == "retract":
+            st["x"] = max(HOME_X, st["x"] - RETRACT_SPEED * dt)
+            _move(st["prim"], st["x"])
+            if st["x"] <= HOME_X + 1e-6:
+                st["phase"] = "idle"
+                st["box"] = None
+
+    # ── 분기 대상 탐색 ──────────────────────────────────
+    for prim in root.GetChildren():
+        path = prim.GetPath().pathString
+        slug = _color_of(prim)
+        if slug is None:
+            continue
+        target_y, pname, label = ROUTE[slug]
+        if target_y is None or pname is None:
+            continue
+        st = pushers.get(pname)
+        if st is None or st["phase"] != "idle" or path in claimed:
+            continue
+
+        p = _pos(prim)
+        if p[0] > X_ON_LANE:                       # 이미 분기 레인 쪽
+            continue
+        dy = target_y - p[1]
+        if TRIG_HI < dy < TRIG_LO:
+            st["phase"] = "extend"
+            st["box"] = path
+            claimed.add(path)
+            _state["routed"][path] = label
+            print(f"[sorter] {prim.GetName()} -> {label}  "
+                  f"(y={p[1]:.3f}, Pusher_{pname} 전진)")
